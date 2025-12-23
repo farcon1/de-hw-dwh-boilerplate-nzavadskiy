@@ -1,0 +1,10 @@
+bank_clickhouse:
+  target: dev
+  outputs:
+    dev:
+      type: clickhouse
+      schema: bank_dwh
+      host: clickhouse
+      port: 9000
+      user: airflow
+      password: airflow

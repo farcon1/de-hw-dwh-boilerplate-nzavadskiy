@@ -1,0 +1,225 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.11
+    container_name: ch-bank-simple
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - ch_data:/var/lib/clickhouse
+      - ./clickhouse_init:/docker-entrypoint-initdb.d
+    ports:
+      - "8123:8123"   # HTTP
+      - "9000:9000"   # Native
+    networks:
+      - bank-net
+    environment:
+      - CLICKHOUSE_USER=airflow
+      - CLICKHOUSE_PASSWORD=airflow
+      - CLICKHOUSE_DB=bank_dwh
+
+  airflow:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: airflow-bank-simple
+    depends_on:
+      - clickhouse
+    env_file:
+      - .env
+    environment:
+      # Airflow базовые настройки (SQLite + SequentialExecutor для простоты)
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__FERNET_KEY=XPgrBf7F0__g9uMq-pA8izmafHdHT663IKGe--jq9mw=
+
+      # ClickHouse из контейнера Airflow
+      - CH_HOST=clickhouse
+      - CH_PORT=9000
+      - CH_USER=airflow
+      - CH_PASS=airflow
+
+      - DBT_PROFILES_DIR=/opt/airflow/dbt
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./dbt:/opt/airflow/dbt
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "
+      airflow db init &&
+      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || true &&
+      airflow webserver &
+      airflow scheduler
+      "
+    networks:
+      - bank-net
+
+  metabase:
+    image: metabase/metabase:v0.57.x
+    container_name: metabase-bank-simple
+    depends_on:
+      - clickhouse
+    environment:
+      - MB_SITE_URL=http://localhost:3000
+    ports:
+      - "3000:3000"
+    networks:
+      - bank-net
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: zk-bank
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks: [bank-net]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka-bank
+    depends_on: [zookeeper]
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_ZOOKEEPER_SESSION_TIMEOUT_MS: 6000
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks: [bank-net]
+
+
+  debezium:
+    image: debezium/connect:2.7.0.Final
+    container_name: debezium-connect
+    depends_on: [kafka]
+    environment:
+      - BOOTSTRAP_SERVERS=kafka:9092
+      - GROUP_ID=1
+      - CONFIG_STORAGE_TOPIC=dbz_config
+      - OFFSET_STORAGE_TOPIC=dbz_offset
+      - STATUS_STORAGE_TOPIC=dbz_status
+      - KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - KEY_CONVERTER_SCHEMAS_ENABLE=false
+      - VALUE_CONVERTER_SCHEMAS_ENABLE=false
+      - CONFIG_STORAGE_REPLICATION_FACTOR=1
+      - OFFSET_STORAGE_REPLICATION_FACTOR=1
+      - STATUS_STORAGE_REPLICATION_FACTOR=1
+    ports:
+      - "8083:8083"
+    networks: [bank-net]
+
+  cdc-consumer:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: cdc-consumer
+    depends_on:
+      - kafka
+      - clickhouse
+      - debezium
+    environment:
+      - KAFKA_BOOTSTRAP=kafka:9092
+
+      # Debezium topics
+      - DEBEZIUM_SERVER_NAME=bankcdc
+
+      # Какие таблицы/топики слушаем (можно несколько)
+      - CDC_TOPICS=bankcdc.bank.transaction,bankcdc.bank.card
+
+      # CH
+      - CH_HOST=clickhouse
+      - CH_PORT=9000
+      - CH_USER=airflow
+      - CH_PASS=airflow
+
+      # Consumer settings
+      - CDC_CONSUMER_GROUP=ch_cdc_v1
+      - CDC_BATCH_SIZE=500
+      - CDC_POLL_TIMEOUT_MS=1000
+    volumes:
+      - ./cdc:/opt/cdc
+    command: >
+      bash -lc "python /opt/cdc/cdc_consumer_multi.py"
+    networks:
+      - bank-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -q cdc_consumer_multi.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  debezium-init:
+    image: curlimages/curl:8.10.1
+    container_name: debezium-init
+    depends_on:
+      - debezium
+    volumes:
+      - ./debezium:/connectors:ro
+    env_file:
+      - .env
+    command: >
+      sh -lc '
+        set -eux;
+
+        echo "Waiting for Debezium Connect.";
+        until curl -sSf http://debezium:8083/connectors > /dev/null; do sleep 2; done;
+
+        echo "Connectors dir:";
+        ls -la /connectors;
+
+        for f in /connectors/*.json; do
+          echo "Rendering and registering: $$f";
+
+          tmp="/tmp/$$(basename $$f)";
+
+          sed \
+            -e "s|\${PG_HOST}|$${PG_HOST}|g" \
+            -e "s|\${PG_PORT}|$${PG_PORT}|g" \
+            -e "s|\${PG_USER}|$${PG_USER}|g" \
+            -e "s|\${PG_PASSWORD}|$${PG_PASSWORD}|g" \
+            -e "s|\${PG_DB}|$${PG_DB}|g" \
+            "$$f" > "$$tmp";
+
+          echo "Rendered payload:";
+          cat "$$tmp";
+          echo "";
+
+          resp=$$(curl -sS -X POST -H "Content-Type: application/json" \
+            --data @"$$tmp" \
+            -w "\nHTTP=%{http_code}\n" \
+            http://debezium:8083/connectors || true);
+
+          echo "$$resp";
+        done
+
+        echo "Registered connectors:";
+        curl -sS http://debezium:8083/connectors;
+        echo "";
+      '
+    networks: [bank-net]
+    restart: "no"
+
+
+
+
+
+
+
+volumes:
+  ch_data:
+
+networks:
+  bank-net:
+    driver: bridge

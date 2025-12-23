@@ -1,0 +1,14 @@
+version: 2
+
+sources:
+  - name: bank_dwh
+    schema: bank_dwh
+    tables:
+      - name: stg_customer
+      - name: stg_account
+      - name: stg_card
+      - name: stg_terminal
+      - name: stg_transaction
+      - name: stg_transaction_cdc
+      - name: stg_cdc_card
+      - name: stg_cdc_transaction

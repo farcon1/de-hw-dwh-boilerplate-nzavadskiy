@@ -1,0 +1,24 @@
+name: "bank_dwh"
+version: "1.0.0"
+config-version: 2
+
+profile: "bank_clickhouse"
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+models:
+  bank_dwh:
+    +materialized: table
+    stg:
+      +materialized: view
+    raw:
+      +materialized: incremental
+    ods:
+      +materialized: table
+    cdm:
+      +materialized: table
+    dm:
+      +materialized: table
